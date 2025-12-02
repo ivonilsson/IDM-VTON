@@ -22,11 +22,11 @@ from diffusers.utils import is_torch_version, logging
 from diffusers.utils.torch_utils import apply_freeu
 from diffusers.models.activations import get_activation
 from diffusers.models.attention_processor import Attention, AttnAddedKVProcessor, AttnAddedKVProcessor2_0
-from diffusers.models.dual_transformer_2d import DualTransformer2DModel
 from diffusers.models.normalization import AdaGroupNorm
 from diffusers.models.resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
 from src.transformerhacked_garmnet import Transformer2DModel
 from einops import rearrange
+from tryon.compat import DualTransformer2DModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 

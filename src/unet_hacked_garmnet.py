@@ -37,7 +37,6 @@ from diffusers.models.embeddings import (
     ImageHintTimeEmbedding,
     ImageProjection,
     ImageTimeEmbedding,
-    PositionNet,
     TextImageProjection,
     TextImageTimeEmbedding,
     TextTimeEmbedding,
@@ -53,7 +52,7 @@ from src.unet_block_hacked_garmnet import (
     get_up_block,
 )
 from diffusers.models.resnet import Downsample2D, FirDownsample2D, FirUpsample2D, KDownsample2D, KUpsample2D, ResnetBlock2D, Upsample2D
-from diffusers.models.transformer_2d import Transformer2DModel
+from tryon.compat import PositionNet, Transformer2DModel
 
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -749,12 +748,18 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
                 f" number of attention layers: {count}. Please make sure to pass {count} processor classes."
             )
 
+        def _assign_processor(target: torch.nn.Module, proc):
+            try:
+                target.set_processor(proc, _remove_lora=_remove_lora)
+            except TypeError:
+                target.set_processor(proc)
+
         def fn_recursive_attn_processor(name: str, module: torch.nn.Module, processor):
             if hasattr(module, "set_processor"):
                 if not isinstance(processor, dict):
-                    module.set_processor(processor, _remove_lora=_remove_lora)
+                    _assign_processor(module, processor)
                 else:
-                    module.set_processor(processor.pop(f"{name}.processor"), _remove_lora=_remove_lora)
+                    _assign_processor(module, processor.pop(f"{name}.processor"))
 
             for sub_name, child in module.named_children():
                 fn_recursive_attn_processor(f"{name}.{sub_name}", child, processor)

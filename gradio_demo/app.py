@@ -1,5 +1,18 @@
 import sys
-sys.path.append('./')
+from pathlib import Path
+
+_THIS_DIR = Path(__file__).resolve().parent
+_IDM_VTON_ROOT = _THIS_DIR.parent
+_PROJECT_ROOT = _THIS_DIR.parents[3]
+_REPO_ROOT = _THIS_DIR.parents[2]
+
+_DENSEPOSE_CFG = _IDM_VTON_ROOT / "configs" / "densepose_rcnn_R_50_FPN_s1x.yaml"
+_DENSEPOSE_CKPT = _IDM_VTON_ROOT / "ckpt" / "densepose" / "model_final_162be9.pkl"
+
+for path in (_IDM_VTON_ROOT, _REPO_ROOT, _PROJECT_ROOT):
+    str_path = str(path)
+    if str_path not in sys.path:
+        sys.path.insert(0, str_path)
 from PIL import Image
 import gradio as gr
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
@@ -16,7 +29,7 @@ from typing import List
 
 import torch
 import os
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor, AutoModelForCausalLM
 import numpy as np
 from utils_mask import get_mask_location
 from torchvision import transforms
@@ -27,6 +40,145 @@ from detectron2.data.detection_utils import convert_PIL_to_numpy,_apply_exif_ori
 from torchvision.transforms.functional import to_pil_image
 
 device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+
+VLM_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+_vlm_model = None
+_vlm_processor = None
+
+
+def _vlm_dtype():
+    if torch.cuda.is_available():
+        major, _ = torch.cuda.get_device_capability(0)
+        if major >= 8:
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
+def _load_vlm():
+    global _vlm_model, _vlm_processor
+    if _vlm_model is None or _vlm_processor is None:
+        dtype = _vlm_dtype()
+        _vlm_processor = AutoProcessor.from_pretrained(
+            VLM_MODEL_ID,
+            trust_remote_code=True,
+        )
+        _vlm_model = AutoModelForCausalLM.from_pretrained(
+            VLM_MODEL_ID,
+            torch_dtype=dtype,
+            device_map="auto" if torch.cuda.is_available() else None,
+            trust_remote_code=True,
+        )
+        if not torch.cuda.is_available():
+            _vlm_model = _vlm_model.to(dtype=dtype)
+        _vlm_model.eval()
+    return _vlm_model, _vlm_processor
+
+
+def _clean_vlm_response(text: str) -> str:
+    if not text:
+        return "a garment"
+    cleaned = text.strip()
+    if "Assistant:" in cleaned:
+        cleaned = cleaned.split("Assistant:")[-1].strip()
+    if cleaned.lower().startswith("assistant"):
+        cleaned = cleaned.split(":", 1)[-1].strip()
+    if not cleaned:
+        return "a garment"
+    return cleaned.replace("\n", " ").strip()
+
+
+def generate_garment_description(image: Image.Image | None) -> str:
+    if image is None:
+        return "a garment"
+    try:
+        model, processor = _load_vlm()
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[WARN] Failed to load VLM: {exc}")
+        return "a garment"
+
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {
+                    "type": "text",
+                    "text": (
+                        "Describe the garment in this image for a virtual try-on system. "
+                        "Mention color, garment type, sleeve/fit, and distinguishing details in ~15 words."
+                    ),
+                },
+            ],
+        }
+    ]
+
+    try:
+        prompt = processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        inputs = processor(
+            text=[prompt],
+            images=[image],
+            return_tensors="pt",
+        )
+        processed_inputs = {}
+        for key, value in inputs.items():
+            if hasattr(value, "to"):
+                if value.dtype in (torch.float16, torch.float32, torch.bfloat16):
+                    processed_inputs[key] = value.to(model.device, dtype=model.dtype)
+                else:
+                    processed_inputs[key] = value.to(model.device)
+            else:
+                processed_inputs[key] = value
+        inputs = processed_inputs
+        with torch.inference_mode():
+            generated_ids = model.generate(
+                **inputs,
+                max_new_tokens=80,
+                temperature=0.2,
+                top_p=0.85,
+            )
+        prompt_length = inputs["input_ids"].shape[-1] if "input_ids" in inputs else 0
+        new_tokens = generated_ids[:, prompt_length:]
+        decoded = processor.batch_decode(new_tokens, skip_special_tokens=True)
+        return _clean_vlm_response(decoded[0] if decoded else "")
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[WARN] Failed to generate garment description: {exc}")
+        return "a garment"
+
+
+def _extract_human_image(editor_state):
+    if isinstance(editor_state, Image.Image):
+        return editor_state.convert("RGB")
+    if isinstance(editor_state, dict):
+        for key in ("image", "background", "composite"):
+            candidate = editor_state.get(key)
+            if isinstance(candidate, Image.Image):
+                return candidate.convert("RGB")
+        layers = editor_state.get("layers")
+        if isinstance(layers, list):
+            for layer in layers:
+                if isinstance(layer, Image.Image):
+                    return layer.convert("RGB")
+    raise ValueError("No person image supplied. Please upload a photo.")
+
+
+def _extract_manual_mask(editor_state):
+    if not isinstance(editor_state, dict):
+        return None
+    layers = editor_state.get("layers")
+    if isinstance(layers, list):
+        for layer in layers:
+            if isinstance(layer, Image.Image):
+                return layer.convert("L")
+    mask = editor_state.get("mask")
+    if isinstance(mask, Image.Image):
+        return mask.convert("L")
+    return None
+
 
 def pil_to_binary_mask(pil_image, threshold=0):
     np_image = np.array(pil_image)
@@ -123,14 +275,17 @@ pipe = TryonPipeline.from_pretrained(
 )
 pipe.unet_encoder = UNet_Encoder
 
-def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_steps,seed):
-    
+def start_tryon(editor_state,garm_img,garment_des,is_checked,is_checked_crop,denoise_steps,seed):
+    garment_des = (garment_des or "").strip()
+    if not garment_des:
+        garment_des = generate_garment_description(garm_img)
+
     openpose_model.preprocessor.body_estimation.model.to(device)
     pipe.to(device)
     pipe.unet_encoder.to(device)
 
     garm_img= garm_img.convert("RGB").resize((768,1024))
-    human_img_orig = dict["background"].convert("RGB")    
+    human_img_orig = _extract_human_image(editor_state)
     
     if is_checked_crop:
         width, height = human_img_orig.size
@@ -146,16 +301,16 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
     else:
         human_img = human_img_orig.resize((768,1024))
 
+    manual_mask_img = _extract_manual_mask(editor_state)
+    use_auto_mask = is_checked or manual_mask_img is None
 
-    if is_checked:
+    if use_auto_mask:
         keypoints = openpose_model(human_img.resize((384,512)))
         model_parse, _ = parsing_model(human_img.resize((384,512)))
         mask, mask_gray = get_mask_location('hd', "upper_body", model_parse, keypoints)
         mask = mask.resize((768,1024))
     else:
-        mask = pil_to_binary_mask(dict['layers'][0].convert("RGB").resize((768, 1024)))
-        # mask = transforms.ToTensor()(mask)
-        # mask = mask.unsqueeze(0)
+        mask = pil_to_binary_mask(manual_mask_img.resize((768, 1024)))
     mask_gray = (1-transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray+1.0)/2.0)
 
@@ -165,7 +320,18 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
      
     
 
-    args = apply_net.create_argument_parser().parse_args(('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm', '-v', '--opts', 'MODEL.DEVICE', 'cuda'))
+    args = apply_net.create_argument_parser().parse_args(
+        (
+            'show',
+            str(_DENSEPOSE_CFG),
+            str(_DENSEPOSE_CKPT),
+            'dp_segm',
+            '-v',
+            '--opts',
+            'MODEL.DEVICE',
+            'cuda',
+        )
+    )
     # verbosity = getattr(args, "verbosity", None)
     pose_img = args.func(args,human_img_arg)    
     pose_img = pose_img[:,:,::-1]    
@@ -236,10 +402,14 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
     if is_checked_crop:
         out_img = images[0].resize(crop_size)        
         human_img_orig.paste(out_img, (int(left), int(top)))    
-        return human_img_orig, mask_gray
+        return human_img_orig, mask_gray, garment_des
     else:
-        return images[0], mask_gray
+        return images[0], mask_gray, garment_des
     # return images[0], mask_gray
+
+
+def update_description(garm_img):
+    return generate_garment_description(garm_img)
 
 garm_list = os.listdir(os.path.join(example_path,"cloth"))
 garm_list_path = [os.path.join(example_path,"cloth",garm) for garm in garm_list]
@@ -264,9 +434,14 @@ with image_blocks as demo:
     gr.Markdown("Virtual Try-on with your image and garment image. Check out the [source codes](https://github.com/yisol/IDM-VTON) and the [model](https://huggingface.co/yisol/IDM-VTON)")
     with gr.Row():
         with gr.Column():
-            imgs = gr.ImageEditor(sources='upload', type="pil", label='Human. Mask with pen or use auto-masking', interactive=True)
+            imgs = gr.ImageEditor(
+                sources='upload',
+                type="pil",
+                label='Human (auto mask enabled by default). Draw only if you want a custom mask.',
+                interactive=True,
+            )
             with gr.Row():
-                is_checked = gr.Checkbox(label="Yes", info="Use auto-generated mask (Takes 5 seconds)",value=True)
+                is_checked = gr.Checkbox(label="Use auto-generated mask", info="Recommended",value=True)
             with gr.Row():
                 is_checked_crop = gr.Checkbox(label="Yes", info="Use auto-crop & resizing",value=False)
 
@@ -278,19 +453,22 @@ with image_blocks as demo:
 
         with gr.Column():
             garm_img = gr.Image(label="Garment", sources='upload', type="pil")
-            with gr.Row(elem_id="prompt-container"):
-                with gr.Row():
-                    prompt = gr.Textbox(placeholder="Description of garment ex) Short Sleeve Round Neck T-shirts", show_label=False, elem_id="prompt")
+            garment_desc = gr.Textbox(
+                label="Auto garment description",
+                placeholder="Description will appear after upload",
+                interactive=False,
+            )
             example = gr.Examples(
                 inputs=garm_img,
                 examples_per_page=8,
                 examples=garm_list_path)
+            garm_img.change(fn=update_description, inputs=[garm_img], outputs=[garment_desc])
         with gr.Column():
             # image_out = gr.Image(label="Output", elem_id="output-img", height=400)
-            masked_img = gr.Image(label="Masked image output", elem_id="masked-img",show_share_button=False)
+            masked_img = gr.Image(label="Masked image output", elem_id="masked-img")
         with gr.Column():
             # image_out = gr.Image(label="Output", elem_id="output-img", height=400)
-            image_out = gr.Image(label="Output", elem_id="output-img",show_share_button=False)
+            image_out = gr.Image(label="Output", elem_id="output-img")
 
 
 
@@ -304,10 +482,15 @@ with image_blocks as demo:
 
 
 
-    try_button.click(fn=start_tryon, inputs=[imgs, garm_img, prompt, is_checked,is_checked_crop, denoise_steps, seed], outputs=[image_out,masked_img], api_name='tryon')
+    try_button.click(
+        fn=start_tryon,
+        inputs=[imgs, garm_img, garment_desc, is_checked, is_checked_crop, denoise_steps, seed],
+        outputs=[image_out, masked_img, garment_desc],
+        api_name='tryon'
+    )
 
             
 
 
-image_blocks.launch()
+image_blocks.launch(server_name="0.0.0.0", server_port=9090, share=True)
 
